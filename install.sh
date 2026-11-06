@@ -174,6 +174,29 @@ EOF
   warn "macOS may ask to allow Bluetooth and Keychain access for Python - allow both."
 fi
 
+# The status line is the cheap usage source; we don't own it, so only check.
+statusline_feeds_us() {
+  python3 - "$SETTINGS" <<'PY'
+import json, os, shlex, sys
+try:
+    cmd = json.load(open(sys.argv[1])).get("statusLine", {}).get("command", "")
+except (OSError, ValueError, AttributeError):
+    sys.exit(1)
+if "eink_hook.py" in cmd:
+    sys.exit(0)
+try:
+    script = os.path.expanduser(shlex.split(cmd)[0])
+    sys.exit(0 if "eink_hook.py" in open(script, errors="ignore").read() else 1)
+except (OSError, ValueError, IndexError):
+    sys.exit(1)
+PY
+}
+if ! statusline_feeds_us; then
+  warn "your Claude Code status line doesn't feed the bridge, so it polls the rate-limited"
+  warn "usage API every 5 min while Claude is in use. To avoid that, add to your status line script:"
+  echo "    printf '%s' \"\$payload\" | python3 -I $PREFIX/eink_hook.py --statusline >/dev/null 2>&1 &"
+fi
+
 say "Done. Plug the board in over USB or switch it on nearby; it shows up within a minute."
 echo "    Logs:      $logs"
 echo "    Uninstall: $0 --uninstall"

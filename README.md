@@ -5,17 +5,40 @@ Shows Claude session (5 h) and weekly usage on a LilyGO T5 4.7" e-paper board
 banner - with a full-panel blink - when a Claude Code session is waiting on you.
 
 ```
-Claude Code hooks --datagram--> host/eink_bridge.py --USB serial / BLE--> board
-usage endpoint   --HTTPS------^
+Claude Code hooks       --datagram--> host/eink_bridge.py --USB serial / BLE--> board
+Claude Code status line --datagram--^
+usage endpoint          --HTTPS-----^
 ```
 
 - `firmware/` - PlatformIO project for the board. `pio run -t upload` from there.
-- `host/eink_bridge.py` - polls usage every 5 min (with the OAuth token Claude
-  Code keeps in `~/.claude/.credentials.json`; read-only), tracks sessions from
-  hook events, pushes state to the board over serial and BLE.
+- `host/eink_bridge.py` - takes 5 h / weekly usage from the status line feed,
+  polls the usage endpoint (with the OAuth token Claude Code keeps in
+  `~/.claude/.credentials.json`; read-only) for the per-product breakdown,
+  tracks sessions from hook events, pushes state to the board over serial and BLE.
 - `host/eink_hook.py` - the Claude Code hook. Registered by `install.sh` in
   `~/.claude/settings.json` for SessionStart, UserPromptSubmit, PostToolUse,
   Notification, Stop and SessionEnd. Async, and silent if the bridge is down.
+  With `--statusline` it forwards the status line's `rate_limits` instead.
+
+## Usage data and rate limits
+
+The usage endpoint is rate-limited, so the bridge calls it as little as it can:
+
+- **Status line feed (preferred).** Claude Code gives its status line command
+  the 5 h and weekly usage (`rate_limits`, Pro/Max plans) at no API cost. Add
+  this line to your status line script, after it reads stdin into `$payload`:
+
+  ```sh
+  printf '%s' "$payload" | python3 -I ~/.local/share/claude-eink/eink_hook.py --statusline >/dev/null 2>&1 &
+  ```
+
+  While this feed is live (data in the last hour) the bridge polls the endpoint
+  only every 30 min, for the per-product breakdown.
+- **Without the feed** the bridge polls every 5 min, plus after a turn ends
+  (at most once a minute).
+- **Either way** it skips a poll when no Claude session did anything since the
+  last one, and on HTTP 429/503 it waits for `Retry-After` or backs off
+  (5 min, doubling to 6 h). The BOOT button doesn't skip the backoff.
 - `probe/` - hardware probe sketch (chip/flash/PSRAM report).
 
 ## Setting up a computer
@@ -87,4 +110,6 @@ No firmware-controllable LEDs on this board (all are wired to power/charging).
 GPIO 13/14/15 on the 4-pin headers are free for an external LED or WS2812 strip;
 avoid GPIO12 (boot strapping pin).
 
-The usage endpoint (`/api/oauth/usage`) is undocumented and may change.
+The usage endpoint (`/api/oauth/usage`) is undocumented and may change. The
+status line `rate_limits` field is documented at
+<https://code.claude.com/docs/en/statusline>.

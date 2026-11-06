@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Feeds Claude usage and session state to the LilyGO e-ink display.
 
+- Takes the 5 h / 7 day usage from Claude Code's status line (eink_hook.py
+  --statusline forwards its rate_limits), which costs no API calls.
 - Polls the Claude usage endpoint with the OAuth token Claude Code keeps in
   ~/.claude/.credentials.json (read-only: we never refresh or write it; Claude
-  Code does that whenever it runs).
+  Code does that whenever it runs) for the per-product breakdown, and as a
+  fallback when no status line feeds us. The endpoint is rate-limited, so this
+  poll is slow, skipped while Claude is idle, and backs off on HTTP 429.
 - Listens on a unix datagram socket for events from eink_hook.py.
 - Pushes the combined state to the board over USB serial and/or BLE as
   newline-delimited JSON (protocol: firmware/src/main.cpp).
@@ -12,6 +16,7 @@ import argparse
 import asyncio
 import collections
 import datetime as dt
+import email.utils
 import json
 import logging
 import os
@@ -37,9 +42,13 @@ BLE_NAME = "Claude E-Ink"
 NUS_RX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 NUS_TX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 
-USAGE_EVERY = 300        # seconds between usage polls
+USAGE_EVERY = 300        # seconds between usage polls without a status line feed
+USAGE_EVERY_LIVE = 1800  # ... and with one (then the poll is only for the breakdown)
+LIVE_FRESH = 3600        # status line data this recent counts as a live feed
 USAGE_MIN_GAP = 60       # floor for event-triggered polls
 USAGE_BUTTON_GAP = 10    # floor when you ask for it with the button
+BACKOFF_MIN = 300        # first wait after HTTP 429 without Retry-After, then doubles
+BACKOFF_MAX = 6 * 3600
 DND_LENGTH = 3600
 PING_EVERY = 30
 SESSION_TTL = 12 * 3600  # forget sessions we haven't heard from in this long
@@ -62,6 +71,27 @@ def hhmm(t):
 
 class UsageError(Exception):
     pass
+
+
+class RateLimited(UsageError):
+    def __init__(self, msg, retry_after=None):
+        super().__init__(msg)
+        self.retry_after = retry_after  # seconds, if the server said
+
+
+def retry_after_seconds(value):
+    """Retry-After is either delta-seconds or an HTTP date."""
+    if not value:
+        return None
+    try:
+        return max(0, int(value))
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+        return max(0, int((when - dt.datetime.now(dt.timezone.utc)).total_seconds()))
+    except (TypeError, ValueError):
+        return None
 
 
 def read_credentials():
@@ -94,6 +124,9 @@ def fetch_usage():
         with urllib.request.urlopen(req, timeout=20) as r:
             return json.load(r)
     except urllib.error.HTTPError as e:
+        if e.code in (429, 503):
+            raise RateLimited(f"usage API HTTP {e.code}",
+                              retry_after_seconds(e.headers.get("Retry-After"))) from e
         raise UsageError(f"usage API HTTP {e.code}") from e
     except (urllib.error.URLError, TimeoutError, ValueError) as e:
         raise UsageError("usage API unreachable") from e
@@ -108,6 +141,10 @@ def describe_window(w, length, now):
     if w.get("resets_at"):
         reset = dt.datetime.fromisoformat(w["resets_at"])
         left = reset - now
+        if left.total_seconds() <= 0:
+            # Polls stop while Claude is idle, so the data can outlive its
+            # window. A window that has ended has nothing used in it.
+            return {"pct": 0, "reset": "-- window ended"}
         local = reset.astimezone()
         same_day = local.date() == now.astimezone().date()
         out["reset"] = local.strftime("%H:%M" if same_day else "%a %H:%M")
@@ -130,6 +167,7 @@ class Sessions:
         self.by_id = {}
         self.alert_seq = 0
         self.acked = set()   # session ids whose current wait was dismissed
+        self.last_event = 0.0  # usage can only move when Claude is in use
 
     def handle(self, ev):
         """Applies one hook event. Returns True if a usage refresh is worth doing."""
@@ -138,6 +176,7 @@ class Sessions:
         if not sid or not name:
             return False
         now = time.time()
+        self.last_event = now
         if name == "SessionEnd":
             self.by_id.pop(sid, None)
             self.acked.discard(sid)
@@ -378,6 +417,10 @@ class Bridge:
         self.usage_at = None
         self.usage_error = ""
         self.last_fetch = 0.0
+        self.last_check = 0.0
+        self.live_at = 0.0       # last status line rate_limits we took
+        self.backoff = 0         # current 429 backoff step, seconds
+        self.backoff_until = 0.0
         self.refresh_soon = asyncio.Event()
         self.refresh_gap = USAGE_MIN_GAP
         self.dnd_until = 0.0
@@ -420,7 +463,11 @@ class Bridge:
 
     def command(self, what):
         if what == "refresh_usage":
-            log.info("refreshing usage (button)")
+            if self.backoff_until > time.time():
+                log.info("refresh asked; the usage API is rate-limited, refreshing at %s",
+                         time.strftime("%H:%M", time.localtime(self.backoff_until)))
+            else:
+                log.info("refreshing usage (button)")
             self.refresh_gap = USAGE_BUTTON_GAP
             self.refresh_soon.set()
         elif what == "dnd":
@@ -462,23 +509,84 @@ class Bridge:
                 await tr.send(line)
                 self.last_sent[tr.name] = key
 
+    def live_fresh(self):
+        return time.time() - self.live_at < LIVE_FRESH
+
+    def apply_live(self, rl):
+        """Takes the rate_limits object from Claude Code's status line input."""
+        if not isinstance(rl, dict):
+            return
+        windows = {}
+        for key in ("five_hour", "seven_day"):
+            w = rl.get(key)
+            if not isinstance(w, dict):
+                continue  # Claude Code drops a window once it resets
+            try:
+                pct = float(w["used_percentage"])
+                reset = w.get("resets_at")
+                reset = dt.datetime.fromtimestamp(float(reset), dt.timezone.utc).isoformat() if reset else None
+            except (KeyError, TypeError, ValueError, OverflowError, OSError):
+                continue
+            windows[key] = {"utilization": pct, "resets_at": reset}
+        if not windows:
+            return
+        if not self.live_fresh():
+            log.info("usage: status line feed live, polling the API every %d min", USAGE_EVERY_LIVE // 60)
+        old = self.usage or {}
+        changed = any(old.get(k) != v for k, v in windows.items())
+        self.usage = {**old, **windows}
+        self.live_at = time.time()
+        now = dt.datetime.now(dt.timezone.utc)
+        # The status line runs many times a minute; moving usage_at on each
+        # one would redraw the panel for nothing.
+        if changed or not self.usage_at or (now - self.usage_at).total_seconds() >= USAGE_EVERY:
+            self.usage_at = now
+            self.usage_error = ""
+
+    async def fetch_once(self, loop):
+        self.last_fetch = time.time()
+        try:
+            usage = await loop.run_in_executor(None, fetch_usage)
+        except RateLimited as e:
+            self.backoff = min(BACKOFF_MAX, max(BACKOFF_MIN, self.backoff * 2))
+            wait = e.retry_after if e.retry_after is not None else self.backoff
+            wait = max(USAGE_MIN_GAP, min(BACKOFF_MAX, wait))
+            self.backoff_until = time.time() + wait
+            until = time.strftime("%H:%M", time.localtime(self.backoff_until))
+            log.warning("usage: %s, backing off until %s", e, until)
+            self.usage_error = f"{e}, retry {until}"
+            return
+        except UsageError as e:
+            log.warning("usage: %s", e)
+            self.usage_error = str(e)
+            return
+        self.backoff = 0
+        self.usage = usage
+        self.usage_at = dt.datetime.now(dt.timezone.utc)
+        self.usage_error = ""
+
     async def poll_usage(self):
         loop = asyncio.get_running_loop()
+        asked = True  # always fetch once at start-up
         while True:
-            self.last_fetch = time.time()
-            try:
-                self.usage = await loop.run_in_executor(None, fetch_usage)
-                self.usage_at = dt.datetime.now(dt.timezone.utc)
-                self.usage_error = ""
-            except UsageError as e:
-                log.warning("usage: %s", e)
-                self.usage_error = str(e)
+            self.last_check = time.time()
+            if self.last_check + 0.5 < self.backoff_until:
+                pass  # rate-limited: wait it out, keeping any request pending
+            elif asked or self.usage is None or self.sessions.last_event > self.last_fetch:
+                await self.fetch_once(loop)
+                asked = False
+            else:
+                log.debug("usage: Claude idle since the last poll, skipping")
             await self.push()
             self.refresh_soon.clear()
+            every = USAGE_EVERY_LIVE if self.live_fresh() else USAGE_EVERY
+            wake = max(self.last_check + every, self.backoff_until)
             try:
-                await asyncio.wait_for(self.refresh_soon.wait(), USAGE_EVERY)
-                await asyncio.sleep(max(0, self.last_fetch + self.refresh_gap - time.time()))
+                await asyncio.wait_for(self.refresh_soon.wait(), max(1, wake - time.time()))
+                asked = True
+                earliest = max(self.last_fetch + self.refresh_gap, self.backoff_until)
                 self.refresh_gap = USAGE_MIN_GAP
+                await asyncio.sleep(max(0, earliest - time.time()))
             except asyncio.TimeoutError:
                 pass
 
@@ -496,9 +604,15 @@ class Bridge:
                 ev = json.loads(data)
             except ValueError:
                 continue
-            log.debug("hook: %s", ev)
-            if self.sessions.handle(ev):
-                self.refresh_soon.set()
+            if not isinstance(ev, dict):
+                continue
+            if "rate_limits" in ev:
+                self.apply_live(ev["rate_limits"])
+            else:
+                log.debug("hook: %s", ev)
+                # With a live status line feed the numbers are already fresh.
+                if self.sessions.handle(ev) and not self.live_fresh():
+                    self.refresh_soon.set()
             await self.push()
 
     async def tick(self):
