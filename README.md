@@ -11,6 +11,8 @@ usage endpoint          --HTTPS-----^
 ```
 
 - `firmware/` - PlatformIO project for the board. `pio run -t upload` from there.
+  The bold fonts in `firmware/src/fonts/` come from `firmware/tools/make_font.py`
+  (Roboto Bold, see its docstring); the regular ones ship with LilyGo-EPD47.
 - `host/eink_bridge.py` - takes 5 h / weekly usage from the status line feed,
   polls the usage endpoint (with the OAuth token Claude Code keeps in
   `~/.claude/.credentials.json`; read-only) for the per-product breakdown,

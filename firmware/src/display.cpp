@@ -6,6 +6,8 @@
 #include <roboto18.h>
 #include <roboto32.h>
 
+#include "fonts/robotobold20.h"
+
 // 4 bits per pixel, 0 = black, 15 = white.
 constexpr uint8_t BLACK = 0x0, DARK = 0x5, MID = 0x9, LIGHT = 0xC, WHITE = 0xF;
 constexpr int FB_SIZE = EPD_WIDTH * EPD_HEIGHT / 2;
@@ -18,11 +20,19 @@ static uint8_t *shown; // what is currently on the panel
 static int partials = PARTIALS_BEFORE_FULL;  // forces a full refresh first time
 
 static const GFXfont *SMALL = &Roboto12, *MEDIUM = &Roboto18, *LARGE = &Roboto32;
+// White on black needs heavier strokes to read well (fonts/ is made by tools/make_font.py).
+static const GFXfont *BOLD = &RobotoBold20;
 
 static int textWidth(const GFXfont *font, const char *s) {
   int32_t x = 0, y = 0, x1, y1, w, h;
   get_text_bounds(font, s, &x, &y, &x1, &y1, &w, &h, nullptr);
   return w;
+}
+
+static int capHeight(const GFXfont *font) {
+  int32_t x = 0, y = 0, x1, y1, w, h;
+  get_text_bounds(font, "H", &x, &y, &x1, &y1, &w, &h, nullptr);
+  return h;
 }
 
 // Draws `s` with its baseline at y, shortened with "..." to fit maxWidth.
@@ -110,19 +120,40 @@ static void drawUsage(int x, int w, const char *label, const UsageWindow &u) {
   text(SMALL, buf, x, 262, w);
 }
 
+// One line, fixed height so the session list below keeps room for 3 rows:
+// "NEEDS INPUT", then the waiting sessions' names, as many as fit, then
+// "+N more" for the rest.
 static int drawAlertBanner(const State &s, int y) {
-  const SessionInfo *waiting = nullptr;
-  for (int i = 0; i < s.nSessions; i++)
-    if (!strcmp(s.sessions[i].state, "waiting")) { waiting = &s.sessions[i]; break; }
-
-  const int h = 78;
+  constexpr int PAD = 16;
+  const int cap = capHeight(BOLD), h = cap + 2 * PAD, base = y + PAD + cap;
   epd_fill_rect(0, y, EPD_WIDTH, h, BLACK, fb);
-  text(MEDIUM, "NEEDS INPUT", 24, y + 52, 0, WHITE, BLACK);
-  if (waiting) {
-    int x = 24 + textWidth(MEDIUM, "NEEDS INPUT") + 28;
-    text(SMALL, waiting->name, x, y + 34, EPD_WIDTH - 24 - x, WHITE, BLACK);
-    text(SMALL, waiting->msg, x, y + 64, EPD_WIDTH - 24 - x, LIGHT, BLACK);
+
+  const char *label = "NEEDS INPUT";
+  text(BOLD, label, 24, base, 0, WHITE, BLACK);
+
+  const char *names[MAX_SESSIONS];
+  int n = 0;
+  for (int i = 0; i < s.nSessions; i++)
+    if (!strcmp(s.sessions[i].state, "waiting")) names[n++] = s.sessions[i].name;
+
+  const int x = 24 + textWidth(BOLD, label) + 40, maxW = EPD_WIDTH - 24 - x;
+  // Take whole names while they, and the "+N more" for the rest, still fit.
+  char line[MAX_SESSIONS * 40] = "", more[16] = "";
+  int shown = 0;
+  for (; shown < n; shown++) {
+    char next[sizeof line], rest[16] = "";
+    snprintf(next, sizeof next, "%s%s%s", line, shown ? ", " : "", names[shown]);
+    if (shown + 1 < n) snprintf(rest, sizeof rest, " +%d more", n - shown - 1);
+    char test[sizeof line + 16];
+    snprintf(test, sizeof test, "%s%s", next, rest);
+    if (shown > 0 && textWidth(BOLD, test) > maxW) break;
+    strlcpy(line, next, sizeof line);
   }
+  if (shown < n) snprintf(more, sizeof more, " +%d more", n - shown);
+  const int moreW = more[0] ? textWidth(BOLD, more) : 0;
+  // A single name that is too long on its own gets cut with "..." instead.
+  text(BOLD, line, x, base, maxW - moreW, WHITE, BLACK);
+  if (more[0]) text(BOLD, more, x + min(textWidth(BOLD, line), maxW - moreW), base, 0, LIGHT, BLACK);
   return y + h + 8;
 }
 
