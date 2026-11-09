@@ -14,6 +14,11 @@ constexpr int FB_SIZE = EPD_WIDTH * EPD_HEIGHT / 2;
 constexpr int ROW_BYTES = EPD_WIDTH / 2;
 // Partial refreshes leave ghosting behind; clear the whole panel after this many.
 constexpr int PARTIALS_BEFORE_FULL = 20;
+// Ghosting and grey levels also drift with time, so a panel that has had any
+// partial refresh gets a full one after this long, even with nothing new on it.
+// millis() restarts after deep sleep, so in battery saver only the count applies.
+constexpr uint32_t FULL_EVERY_MS = 30 * 60 * 1000;
+static uint32_t lastFullMs;
 
 static uint8_t *fb;    // frame being drawn
 static uint8_t *shown; // what is currently on the panel
@@ -259,12 +264,14 @@ void displayMessage(const char *title, const char *subtitle) {
   epd_poweroff();
   memcpy(shown, fb, FB_SIZE);
   partials = 0;
+  lastFullMs = millis();
 }
 
 void displayRender(const State &s, Page page, const LinkStatus &link, bool flash) {
   compose(s, page, link);
 
-  bool full = flash || partials >= PARTIALS_BEFORE_FULL;
+  bool full = flash || partials >= PARTIALS_BEFORE_FULL ||
+              (partials > 0 && millis() - lastFullMs >= FULL_EVERY_MS);
   int top = 0, bottom = EPD_HEIGHT;
   if (!full) {
     // Refresh only the band of rows that actually changed.
@@ -278,6 +285,7 @@ void displayRender(const State &s, Page page, const LinkStatus &link, bool flash
   if (full) {
     epd_clear();
     partials = 0;
+    lastFullMs = millis();
   } else {
     epd_clear_area(area);
     partials++;
